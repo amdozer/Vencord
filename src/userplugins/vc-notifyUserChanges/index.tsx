@@ -5,17 +5,21 @@
  */
 
 import { NavContextMenuPatchCallback } from "@api/ContextMenu";
-import { showNotification } from "@api/Notifications";
 import { definePluginSettings, Settings } from "@api/Settings";
 import { Devs } from "@utils/constants";
+import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import type { Channel, User } from "@vencord/discord-types";
 import { findByPropsLazy, findStoreLazy } from "@webpack";
 import { Menu, PresenceStore, React, SelectedChannelStore, Tooltip, UserStore } from "@webpack/common";
 import { CSSProperties } from "react";
 
+import "./notification.css";
+
 import { NotificationsOffIcon } from "./components/NotificationsOffIcon";
 import { NotificationsOnIcon } from "./components/NotificationsOnIcon";
+
+const logger = new Logger("NotifyUserChanges", "#a6d189");
 
 interface PresenceUpdate {
     user: {
@@ -55,15 +59,6 @@ interface VoiceState {
     sessionId: string;
     suppress: boolean;
     requestToSpeakTimestamp: string | null;
-}
-
-function shouldBeNative() {
-    if (typeof Notification === "undefined") return false;
-
-    const { useNative } = Settings.notifications;
-    if (useNative === "always") return true;
-    if (useNative === "not-focused") return !document.hasFocus();
-    return false;
 }
 
 const SessionsStore = findStoreLazy("SessionsStore");
@@ -133,7 +128,7 @@ const PlatformIndicator = ({ user, wantMargin = true, wantTopMargin = false, sma
         }, {});
 
         const { clientStatuses } = PresenceStore.getState();
-        clientStatuses[UserStore.getCurrentUser().id] = ownStatus;
+        (clientStatuses as any)[UserStore.getCurrentUser().id] = ownStatus;
     }
 
     const status = PresenceStore.getState()?.clientStatuses?.[user.id] as Record<Platform, string>;
@@ -201,46 +196,55 @@ export const settings = definePluginSettings({
 
 function getUserIdList() {
     try {
-        return settings.store.userIds.split(",").filter(Boolean);
+        const userIds = settings.store.userIds.split(",").filter(Boolean);
+        logger.debug("getUserIdList() called, returning:", userIds);
+        return userIds;
     } catch (e) {
+        logger.error("Error in getUserIdList():", e);
         settings.store.userIds = "";
         return [];
     }
 }
 
-// show rich body with user avatar
-const getRichBody = (user: User, text: string | React.ReactNode) => <div
-    style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "10px" }}>
-    <div style={{ position: "relative" }}>
-        <img src={user.getAvatarURL(void 0, 80, true)}
-            style={{ width: "80px", height: "80px", borderRadius: "15%" }} alt={`${user.username}'s avatar`} />
-        <PlatformIndicator user={user} style={{ position: "absolute", top: "-8px", right: "-10px" }} />
-    </div>
-    <span>{text}</span>
-</div>;
-
 function triggerVoiceNotification(userId: string, userChannelId: string | null) {
-    const user = UserStore.getUser(userId);
-    const myChanId = SelectedChannelStore.getVoiceChannelId();
+    logger.debug("triggerVoiceNotification called", { userId, userChannelId });
 
+    const user = UserStore.getUser(userId);
+    if (!user) {
+        logger.warn("User not found for userId:", userId);
+        return;
+    }
+
+    const myChanId = SelectedChannelStore.getVoiceChannelId();
     const name = user.username;
 
-    const title = shouldBeNative() ? `User ${name} changed voice status` : "User voice status change";
+    logger.debug("Voice notification details:", {
+        userId,
+        userName: name,
+        userChannelId,
+        myChanId,
+        persistNotifications: settings.store.persistNotifications
+    });
+
     if (userChannelId) {
         if (userChannelId !== myChanId) {
-            showNotification({
-                title,
-                body: "joined a new voice channel",
-                noPersist: !settings.store.persistNotifications,
-                richBody: getRichBody(user, `${name} joined a new voice channel`),
+            logger.info("Showing notification: User joined voice channel", { userId, name, userChannelId });
+            showCustomNotification({
+                title: `${name} joined a voice channel`,
+                body: "User joined a new voice channel",
+                avatar: user.getAvatarURL(void 0, 80, true),
+                duration: settings.store.persistNotifications ? 0 : 5000
             });
+        } else {
+            logger.debug("Skipping notification: User is in same channel as me", { userId, userChannelId, myChanId });
         }
     } else {
-        showNotification({
-            title,
-            body: "left their voice channel",
-            noPersist: !settings.store.persistNotifications,
-            richBody: getRichBody(user, `${name} left their voice channel`),
+        logger.info("Showing notification: User left voice channel", { userId, name });
+        showCustomNotification({
+            title: `${name} left voice channel`,
+            body: "User left their voice channel",
+            avatar: user.getAvatarURL(void 0, 80, true),
+            duration: settings.store.persistNotifications ? 0 : 5000
         });
     }
 }
@@ -281,6 +285,108 @@ const UserContext: NavContextMenuPatchCallback = (children, { user }: UserContex
 
 const lastStatuses = new Map<string, string>();
 
+// Custom notification system
+let notificationContainer: HTMLDivElement | null = null;
+
+function getNotificationContainer(): HTMLDivElement {
+    if (!notificationContainer) {
+        notificationContainer = document.createElement("div");
+        notificationContainer.id = "vc-notify-user-changes-notification-container";
+        notificationContainer.className = "vc-notify-user-changes-notification-container";
+        document.body.appendChild(notificationContainer);
+        logger.debug("Created custom notification container");
+    }
+    return notificationContainer;
+}
+
+interface CustomNotificationOptions {
+    title: string;
+    body: string;
+    avatar?: string;
+    onClick?: () => void;
+    duration?: number;
+}
+
+function showCustomNotification(options: CustomNotificationOptions) {
+    const container = getNotificationContainer();
+    const notificationId = `vc-notify-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    logger.debug("Showing custom notification", { notificationId, ...options });
+
+    const notification = document.createElement("div");
+    notification.className = "vc-notify-user-changes-notification";
+    notification.id = notificationId;
+
+    const duration = options.duration ?? 5000;
+    let timeoutId: NodeJS.Timeout | null = null;
+
+    const closeNotification = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        notification.classList.add("vc-notify-exit");
+        setTimeout(() => {
+            if (notification.parentElement) {
+                notification.parentElement.removeChild(notification);
+            }
+            logger.debug("Notification closed", { notificationId });
+        }, 300);
+    };
+
+    const avatarHTML = options.avatar
+        ? `<div class="vc-notify-user-changes-notification-avatar"><img src="${options.avatar}" alt="" /></div>`
+        : "";
+
+    const notificationHTML = `
+        ${avatarHTML}
+        <div class="vc-notify-user-changes-notification-content">
+            <h3 class="vc-notify-user-changes-notification-title">${options.title}</h3>
+            <p class="vc-notify-user-changes-notification-body">${options.body}</p>
+        </div>
+        <button class="vc-notify-user-changes-notification-close" aria-label="Close">
+            <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M18.4 4L12 10.4L5.6 4L4 5.6L10.4 12L4 18.4L5.6 20L12 13.6L18.4 20L20 18.4L13.6 12L20 5.6L18.4 4Z"/>
+            </svg>
+        </button>
+    `;
+
+    notification.innerHTML = notificationHTML;
+
+    const closeBtn = notification.querySelector(".vc-notify-user-changes-notification-close");
+    if (closeBtn) {
+        closeBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            closeNotification();
+        });
+    }
+
+    if (options.onClick) {
+        notification.addEventListener("click", (e) => {
+            if (e.target !== closeBtn && !closeBtn?.contains(e.target as Node)) {
+                options.onClick!();
+                closeNotification();
+            }
+        });
+    }
+
+    container.appendChild(notification);
+
+    if (duration > 0) {
+        timeoutId = setTimeout(closeNotification, duration);
+    }
+
+    // Add hover to pause timeout
+    notification.addEventListener("mouseenter", () => {
+        if (timeoutId) clearTimeout(timeoutId);
+    });
+
+    notification.addEventListener("mouseleave", () => {
+        if (duration > 0) {
+            timeoutId = setTimeout(closeNotification, duration);
+        }
+    });
+
+    logger.debug("Custom notification displayed", { notificationId });
+}
+
 export default definePlugin({
     name: "NotifyUserChanges",
     description: "Adds a notify option in the user context menu to get notified when a user changes voice channels or online status",
@@ -292,53 +398,117 @@ export default definePlugin({
         "user-context": UserContext
     },
 
+    start() {
+        logger.info("Plugin started");
+        logger.debug("Current settings:", {
+            notifyStatus: settings.store.notifyStatus,
+            notifyVoice: settings.store.notifyVoice,
+            persistNotifications: settings.store.persistNotifications,
+            userIds: settings.store.userIds,
+            followedUserIds: getUserIdList()
+        });
+    },
+
+    stop() {
+        logger.info("Plugin stopped");
+        lastStatuses.clear();
+    },
+
     flux: {
         VOICE_STATE_UPDATES({ voiceStates }: { voiceStates: VoiceState[]; }) {
+            logger.debug("VOICE_STATE_UPDATES event received", {
+                voiceStatesCount: voiceStates.length,
+                notifyVoice: settings.store.notifyVoice,
+                userIds: settings.store.userIds
+            });
+
             if (!settings.store.notifyVoice || !settings.store.userIds) {
+                logger.debug("VOICE_STATE_UPDATES: Skipping - notifyVoice:", settings.store.notifyVoice, "userIds:", settings.store.userIds);
                 return;
             }
+
+            const followedUserIds = getUserIdList();
+            logger.debug("Followed user IDs:", followedUserIds);
+
             for (const { userId, channelId, oldChannelId } of voiceStates) {
+                logger.debug("Processing voice state update", { userId, channelId, oldChannelId });
+
                 if (channelId !== oldChannelId) {
-                    const isFollowed = getUserIdList().includes(userId);
+                    const isFollowed = followedUserIds.includes(userId);
+                    logger.debug("Voice state changed", { userId, isFollowed, channelId, oldChannelId });
+
                     if (!isFollowed) {
+                        logger.debug("Skipping: User not in followed list", { userId });
                         continue;
                     }
 
                     if (channelId) {
                         // move or join new channel
+                        logger.info("User joined/moved to voice channel", { userId, channelId, oldChannelId });
                         triggerVoiceNotification(userId, channelId);
                     } else if (oldChannelId) {
                         // leave
+                        logger.info("User left voice channel", { userId, oldChannelId });
                         triggerVoiceNotification(userId, null);
                     }
+                } else {
+                    logger.debug("Skipping: No channel change", { userId, channelId, oldChannelId });
                 }
             }
         },
         PRESENCE_UPDATES({ updates }: { updates: PresenceUpdate[]; }) {
+            logger.debug("PRESENCE_UPDATES event received", {
+                updatesCount: updates.length,
+                notifyStatus: settings.store.notifyStatus,
+                userIds: settings.store.userIds
+            });
+
             if (!settings.store.notifyStatus || !settings.store.userIds) {
+                logger.debug("PRESENCE_UPDATES: Skipping - notifyStatus:", settings.store.notifyStatus, "userIds:", settings.store.userIds);
                 return;
             }
+
+            const followedUserIds = getUserIdList();
+            logger.debug("Followed user IDs for presence:", followedUserIds);
+
             for (const { user: { id: userId, username }, status, clientStatus } of updates) {
-                const isFollowed = getUserIdList().includes(userId);
+                logger.debug("Processing presence update", { userId, username, status, hasClientStatus: !!clientStatus });
+
+                const isFollowed = followedUserIds.includes(userId);
                 if (!isFollowed) {
+                    logger.debug("Skipping: User not in followed list", { userId });
                     continue;
                 }
 
                 if (!clientStatus) {
+                    logger.debug("Skipping: No client status", { userId });
                     continue;
                 }
+
+                const lastStatus = lastStatuses.get(userId);
+                logger.debug("Status comparison", { userId, currentStatus: status, lastStatus, statusChanged: lastStatus !== status });
+
                 // this is also triggered for multiple guilds and when only the activities change, so we have to check if the status actually changed
                 if (lastStatuses.has(userId) && lastStatuses.get(userId) !== status) {
                     const user = UserStore.getUser(userId);
+                    if (!user) {
+                        logger.warn("User not found for presence update", { userId });
+                        continue;
+                    }
+
                     // @ts-ignore
                     const name = user.globalName || username;
 
-                    showNotification({
-                        title: shouldBeNative() ? `${name} changed status` : "User status change",
+                    logger.info("Showing notification: User status changed", { userId, name, oldStatus: lastStatus, newStatus: status });
+                    showCustomNotification({
+                        title: `${name}'s status changed`,
                         body: `They are now ${status}`,
-                        noPersist: !settings.store.persistNotifications,
-                        richBody: getRichBody(user, `${name}'s status is now ${status}`),
+                        avatar: user.getAvatarURL(void 0, 80, true),
+                        duration: settings.store.persistNotifications ? 0 : 5000
                     });
+                    logger.debug("Status notification call completed");
+                } else {
+                    logger.debug("Skipping notification: Status unchanged or first time", { userId, status, lastStatus });
                 }
                 lastStatuses.set(userId, status);
             }
